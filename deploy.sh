@@ -1,7 +1,8 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Auto-deploy script for event-platform-console
-# Triggered by GitHub webhook → C server → this script
-# Just git pull (no build, static files)
+
+# Reset SIGCHLD handler (parent server has SIG_IGN which breaks git pull)
+trap - CHLD
 
 set -e
 
