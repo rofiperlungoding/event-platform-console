@@ -134,15 +134,16 @@ function renderSystem(d) {
 }
 
 function renderDb(d) {
-  $('#db-version').textContent = d.database.version;
-  $('#db-size').textContent = fmtBytes(d.database.size_bytes);
-  $('#db-tables-count').textContent = d.tables.length;
+  $('#db-version').textContent = d.database ? d.database.version : (d.database_version || '—');
+  $('#db-size').textContent = fmtBytes(d.database ? d.database.size_bytes : d.database_size_bytes);
+  const tables = d.tables || [];
+  $('#db-tables-count').textContent = tables.length;
 
-  $('#db-tables-body').innerHTML = d.tables.map(t => `
+  $('#db-tables-body').innerHTML = tables.map(t => `
     <tr>
       <td><code>${t.name}</code></td>
-      <td class="num">${t.row_count.toLocaleString()}</td>
-      <td class="num">${fmtBytes(t.size_bytes)}</td>
+      <td class="num">${(t.row_count ?? t.live_tuples ?? 0).toLocaleString()}</td>
+      <td class="num">${fmtBytes(t.size_bytes ?? 0)}</td>
     </tr>
   `).join('') || `<tr><td colspan="3" class="muted">no tables</td></tr>`;
 }
@@ -168,7 +169,7 @@ function renderParticipantStats(d) {
     <tr><td>${escapeHtml(t.team)}</td><td class="num">${t.count}</td></tr>
   `).join('') || `<tr><td colspan="2" class="muted">no teams</td></tr>`;
 
-  $('#recent-body').innerHTML = d.recent_5.map(p => `
+  $('#recent-body').innerHTML = (d.recent_5 || d.recent || []).map(p => `
     <tr>
       <td>${escapeHtml(p.name)}</td>
       <td>${escapeHtml(p.team)}</td>
