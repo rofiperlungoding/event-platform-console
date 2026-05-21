@@ -1,5 +1,10 @@
 name = "event-platform-console"
 compatibility_date = "2026-05-01"
+workers_dev = true
+
+routes = [
+  { pattern = "console.rofidoesthings.site", custom_domain = true }
+]
 
 [assets]
 directory = "./"
