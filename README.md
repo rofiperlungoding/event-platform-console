@@ -76,17 +76,27 @@ resolution.
 
 ## Configuration
 
-The API base URL is hardcoded in two files:
+The API base URL is configured per file:
 
 ```javascript
-// app.js
+// app.js  (admin dashboard, no LAN failover)
 const API = 'https://api.rofidoesthings.site';
 
-// attend/admin.html, attend/scan.html
+// attend/admin.html  (organiser QR generator)
 const API = 'https://api.rofidoesthings.site';
+
+// attend/scan.html  (participant PWA — auto-resolves LAN first)
+const PUBLIC_API     = 'https://api.rofidoesthings.site';
+const DEFAULT_LAN_API = 'http://192.168.100.67:3001';
 ```
 
-When forking for a new deployment, update these constants.
+The scanner PWA probes the LAN endpoint with a 1.5 s timeout on page
+load. If reachable, all subsequent requests bypass the Cloudflare
+Tunnel — this is what makes 2,000 simultaneous check-ins return in
+under two seconds (the tunnel free tier caps at ~45 req/s on its own).
+Operators can override the LAN URL with `?lan=http://...` query
+parameter or by setting `localStorage.ep_lan_url`. When forking for a
+new deployment, update both constants in each file.
 
 ---
 
