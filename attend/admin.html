@@ -60,7 +60,7 @@ h1{font-size:20px;margin-bottom:4px}
 
 <script>
 const API = 'https://api.rofidoesthings.site';
-let token = '', sessionId = null, sessionCode = '', refreshInterval = null, pollInterval = null, countdown = 30, seenIds = new Set();
+let token = '', sessionId = null, sessionCode = '', refreshInterval = null, countdown = 30, seenIds = new Set();
 
 async function login() {
   const email = document.getElementById('email').value;
@@ -93,7 +93,31 @@ async function createSession() {
   updateQR();
   countdown = 30;
   refreshInterval = setInterval(tick, 1000);
-  pollInterval = setInterval(pollAttendance, 2000);
+  /* Open WebSocket for live attendance feed (replaces 2s polling) */
+  openLiveFeed();
+}
+
+let ws = null;
+function openLiveFeed() {
+  const wsUrl = API.replace('https://', 'wss://').replace('http://', 'ws://');
+  ws = new WebSocket(`${wsUrl}/ws/attendance/${sessionId}?token=${encodeURIComponent(token)}`);
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.event === 'checkin') {
+        if (!seenIds.has(msg.id)) {
+          seenIds.add(msg.id);
+          addFeedItem(msg);
+          document.getElementById('checkin-count').textContent = seenIds.size;
+        }
+      }
+    } catch (_) {}
+  };
+  ws.onclose = () => {
+    /* Auto-reconnect after 3 seconds */
+    setTimeout(() => { if (sessionId) openLiveFeed(); }, 3000);
+  };
+  ws.onerror = (e) => console.error('WS error', e);
 }
 
 function updateQR() {
@@ -155,22 +179,6 @@ async function tick() {
   }
 }
 
-async function pollAttendance() {
-  try {
-    const r = await fetch(`${API}/attendance/session/${sessionId}`, {
-      headers: {'Authorization': `Bearer ${token}`}
-    });
-    const list = await r.json();
-    document.getElementById('checkin-count').textContent = list.length;
-    // Add new entries to feed
-    for (const item of list) {
-      if (seenIds.has(item.id)) continue;
-      seenIds.add(item.id);
-      addFeedItem(item);
-    }
-  } catch(e) { console.error(e); }
-}
-
 function addFeedItem(item) {
   const feed = document.getElementById('feed');
   const initials = item.name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();
@@ -190,7 +198,8 @@ function addFeedItem(item) {
 
 function stopSession() {
   clearInterval(refreshInterval);
-  clearInterval(pollInterval);
+  if (ws) { ws.onclose = null; ws.close(); ws = null; }
+  sessionId = null;
   document.getElementById('qr-container').innerHTML = '<h2 style="color:var(--muted);margin-top:48px">Session ended</h2><p style="color:var(--muted);font-size:14px;margin-top:8px">' + seenIds.size + ' total check-ins</p>';
 }
 </script>
