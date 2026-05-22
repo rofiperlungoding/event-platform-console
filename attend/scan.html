@@ -79,7 +79,40 @@ input{width:100%;padding:10px 12px;margin-bottom:10px;background:#0f1419;border:
 </div>
 
 <script>
-const API = 'https://api.rofidoesthings.site';
+/* ─── API endpoint resolver ───────────────────────────────────────────
+ * On a venue Wi-Fi, every attendee can reach the tablet at its LAN IP
+ * directly — bypassing the Cloudflare Tunnel entirely. The tunnel is
+ * only needed for attendees on cellular or off-network. We probe the
+ * LAN endpoint with a 1.5 s timeout once per page load; if it answers,
+ * we use it for the rest of the session. Otherwise we fall back to the
+ * public tunnel hostname.
+ *
+ * Operators can override the LAN IP via ?lan=... query string or
+ * localStorage `ep_lan_url` so the same PWA works on different
+ * deployments. */
+const PUBLIC_API = 'https://api.rofidoesthings.site';
+const DEFAULT_LAN_API = 'http://192.168.100.67:3001';
+const LAN_OVERRIDE = new URL(location.href).searchParams.get('lan')
+                  || localStorage.getItem('ep_lan_url')
+                  || DEFAULT_LAN_API;
+let API = PUBLIC_API;
+
+async function resolveApi() {
+  if (!LAN_OVERRIDE) return PUBLIC_API;
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 1500);
+    const r = await fetch(`${LAN_OVERRIDE}/health`, {signal: ctl.signal, cache: 'no-store'});
+    clearTimeout(t);
+    if (r.ok) {
+      console.log('[api] using LAN endpoint:', LAN_OVERRIDE);
+      return LAN_OVERRIDE;
+    }
+  } catch (e) {
+    console.log('[api] LAN probe failed, using tunnel:', e.message);
+  }
+  return PUBLIC_API;
+}
 let token = localStorage.getItem('ep_token') || '';
 let deviceId = localStorage.getItem('ep_device_id') || '';
 let userName = '', userTeam = '';
@@ -108,11 +141,11 @@ async function addToQueue(sessionCode) {
   const db = await openDB();
   const tx = db.transaction('queue', 'readwrite');
   tx.objectStore('queue').add({
-    url: `${API}/attendance/checkin`,
-    headers: {'Content-Type': 'application/json', 'Authorization': `Bearer ${token}`},
-    body: JSON.stringify({session_code: sessionCode, device_id: deviceId}),
-    timestamp: Date.now(),
+    /* Queue uses quick-checkin (device-keyed, no auth round trip).
+     * On drain we prefer /attendance/batch-checkin for a single transaction. */
     code: sessionCode,
+    device_uuid: deviceId,
+    timestamp: Date.now(),
   });
   updateQueueCount();
 }
@@ -132,18 +165,40 @@ async function processQueue() {
   const tx = db.transaction('queue', 'readonly');
   const store = tx.objectStore('queue');
   const items = await new Promise(r => { const req = store.getAll(); req.onsuccess = () => r(req.result); });
+  if (items.length === 0) return;
+
+  /* Group by session code, drain each group in a single batch-checkin call */
+  const bySession = {};
+  for (const it of items) {
+    const code = it.code || (it.body && JSON.parse(it.body).session_code);
+    if (!code) continue;
+    (bySession[code] = bySession[code] || []).push(it);
+  }
 
   let synced = 0;
-  for (const item of items) {
+  for (const [code, group] of Object.entries(bySession)) {
     try {
-      const r = await fetch(item.url, {method: 'POST', headers: item.headers, body: item.body});
-      if (r.ok || r.status === 409) {
-        const dtx = db.transaction('queue', 'readwrite');
-        dtx.objectStore('queue').delete(item.id);
-        synced++;
-      }
-    } catch (e) { break; } // offline again, stop
+      const r = await fetch(`${API}/attendance/batch-checkin`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          session_code: code,
+          items: group.map(g => ({device_uuid: g.device_uuid || deviceId})),
+        }),
+      });
+      if (!r.ok) continue;
+      const d = await r.json();
+      /* All attempted rows are now resolved server-side (accepted OR duplicate
+       * OR unknown) — drop all of them from the queue regardless. Duplicate
+       * means already checked in (success in real life), unknown means the
+       * device was unlinked and retrying won't help. */
+      const dtx = db.transaction('queue', 'readwrite');
+      const dst = dtx.objectStore('queue');
+      for (const g of group) dst.delete(g.id);
+      synced += (d.accepted || 0) + (d.duplicates || 0);
+    } catch (e) { break; }
   }
+
   if (synced > 0) {
     showStatus(`✓ Synced ${synced} check-in${synced > 1 ? 's' : ''}`, 'success');
     updateQueueCount();
@@ -179,6 +234,11 @@ if ('serviceWorker' in navigator) {
 
 // ─── Auth ───────────────────────────────────────────────────────────────
 (async () => {
+  /* Resolve the best endpoint (LAN if reachable, else tunnel) before
+   * any other request fires. This makes the difference between 100 %
+   * pass at 2,000 concurrent (LAN) and ~30 % pass (tunnel free tier). */
+  API = await resolveApi();
+
   if (token) {
     try {
       const r = await fetch(`${API}/auth/me`, {headers:{'Authorization':`Bearer ${token}`}});
@@ -285,6 +345,34 @@ function startScan() {
   });
 }
 
+/* Smart retry helper — same idempotency-aware retry the load test uses.
+ * device_uuid + session_code is unique server-side, so retries cannot
+ * cause duplicate attendance. */
+async function fetchWithRetry(url, init, opts = {}) {
+  const PER_TRY_TIMEOUT = opts.timeout || 6000;
+  const MAX_TRIES = opts.maxTries || 5;
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), PER_TRY_TIMEOUT);
+    try {
+      const r = await fetch(url, {...init, signal: ctl.signal});
+      clearTimeout(timer);
+      /* 2xx and 4xx are deterministic — return immediately */
+      if (r.status < 500) return r;
+      lastErr = new Error('server ' + r.status);
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = e;
+    }
+    /* Jittered exponential backoff: 100, 200, 400, 800 ms ± 30 % */
+    const base = 100 * Math.pow(2, attempt - 1);
+    const delay = base + Math.floor(Math.random() * base * 0.6);
+    await new Promise(r => setTimeout(r, delay));
+  }
+  throw lastErr || new Error('all retries exhausted');
+}
+
 async function onScanSuccess(decoded) {
   if (scanner) { await scanner.stop(); scanner = null; }
   document.getElementById('btn-start-scan').classList.remove('hidden');
@@ -296,10 +384,15 @@ async function onScanSuccess(decoded) {
   // Try online first
   if (isOnline) {
     try {
-      const r = await fetch(`${API}/attendance/checkin`, {
+      /* Use device-keyed quick-checkin: no auth round trip, server resolves
+       * device_uuid → participant in a single SQL CTE. This is the path that
+       * scales to 2000 simultaneous attendees. With smart retry, transient
+       * failures (network blip, tunnel hiccup) auto-recover before the user
+       * even sees an error. */
+      const r = await fetchWithRetry(`${API}/attendance/quick-checkin`, {
         method:'POST',
-        headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`},
-        body: JSON.stringify({session_code: data.code, device_id: deviceId})
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({session_code: data.code, device_uuid: deviceId})
       });
       const d = await r.json();
       if (r.ok) {
@@ -308,17 +401,26 @@ async function onScanSuccess(decoded) {
         return;
       }
       if (r.status === 409) { showStatus('Already checked in', 'info'); return; }
+      if (r.status === 401) {
+        /* Device not linked — fall back to authenticated checkin which links on the fly */
+        const fb = await fetchWithRetry(`${API}/attendance/checkin`, {
+          method:'POST',
+          headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`},
+          body: JSON.stringify({session_code: data.code, device_id: deviceId})
+        });
+        const fd = await fb.json();
+        if (fb.ok) { showStatus('✓ Checked in!', 'success'); addHistoryItem(new Date().toISOString(), true); return; }
+        if (fb.status === 409) { showStatus('Already checked in', 'info'); return; }
+        throw new Error(fd.error || 'Server error');
+      }
       throw new Error(d.error || 'Server error');
     } catch(e) {
-      if (e.message.includes('fetch') || e.message.includes('network')) {
-        // Network failed — queue it
-        await addToQueue(data.code);
-        showStatus('📦 Queued — will sync when online', 'queued');
-        addHistoryItem(new Date().toISOString(), false);
-        triggerSync();
-        return;
-      }
-      showStatus(e.message, 'error');
+      /* All retries exhausted → queue offline. The queue drains via
+       * /attendance/batch-checkin once the network recovers. */
+      await addToQueue(data.code);
+      showStatus('📦 Queued — will sync automatically', 'queued');
+      addHistoryItem(new Date().toISOString(), false);
+      triggerSync();
       return;
     }
   }

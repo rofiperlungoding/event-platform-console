@@ -1,5 +1,5 @@
 /* Service Worker — offline-first + background sync */
-const CACHE_NAME = 'checkin-v1';
+const CACHE_NAME = 'checkin-v2';
 const STATIC_ASSETS = [
   '/attend/scan.html',
   '/attend/manifest.json',
@@ -61,29 +61,36 @@ self.addEventListener('sync', e => {
 });
 
 async function syncCheckins() {
-  // Open IndexedDB and process queue
+  /* Drain the offline queue using /attendance/batch-checkin so all items
+   * for the same session are committed in a single transaction server-side. */
+  const API = self.registration.scope.replace(/\/$/, '').replace('console.', 'api.');
   const db = await openDB();
-  const tx = db.transaction('queue', 'readonly');
-  const store = tx.objectStore('queue');
-  const items = await getAllFromStore(store);
+  const items = await getAllFromStore(db.transaction('queue', 'readonly').objectStore('queue'));
+  if (items.length === 0) return;
 
-  for (const item of items) {
+  const bySession = {};
+  for (const it of items) {
+    const code = it.code || (it.body && JSON.parse(it.body).session_code);
+    const device_uuid = it.device_uuid;
+    if (!code || !device_uuid) continue;
+    (bySession[code] = bySession[code] || []).push({id: it.id, device_uuid});
+  }
+
+  for (const [code, group] of Object.entries(bySession)) {
     try {
-      const r = await fetch(item.url, {
+      const r = await fetch(`${API}/attendance/batch-checkin`, {
         method: 'POST',
-        headers: item.headers,
-        body: item.body,
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          session_code: code,
+          items: group.map(g => ({device_uuid: g.device_uuid})),
+        }),
       });
-      if (r.ok || r.status === 409) {
-        // Success or already checked in — remove from queue
-        const dtx = db.transaction('queue', 'readwrite');
-        dtx.objectStore('queue').delete(item.id);
-      }
-      // If server error, leave in queue for next sync
-    } catch (e) {
-      // Network error, leave in queue
-      break;
-    }
+      if (!r.ok) continue;
+      const dtx = db.transaction('queue', 'readwrite');
+      const dst = dtx.objectStore('queue');
+      for (const g of group) dst.delete(g.id);
+    } catch (e) { break; }
   }
 }
 
